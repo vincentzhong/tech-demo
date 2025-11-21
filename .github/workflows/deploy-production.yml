@@ -1,0 +1,266 @@
+name: Deploy Bookstore to Production
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'BookstoreApi/**'
+      - 'terraform/modules/**'
+      - 'terraform/environments/production/**'
+      - '.github/workflows/deploy-production.yml'
+      - 'Dockerfile'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ENVIRONMENT: production
+  TERRAFORM_DIR: terraform/environments/production
+  CONTAINER_NAME: api-container
+
+# Prevent concurrent deployments
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+      
+      - name: Restore dependencies
+        run: dotnet restore BookstoreApi/BookstoreApi.csproj
+      
+      - name: Build
+        run: dotnet build --configuration Release --no-restore BookstoreApi/BookstoreApi.csproj
+      
+      - name: Run unit tests (if tests exist)
+        run: |
+          if [ -d "BookstoreApi.Tests" ]; then
+            dotnet test --no-build --verbosity normal --configuration Release
+          else
+            echo "No tests found, skipping test step"
+          fi
+
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: test
+    environment:
+      name: production
+    concurrency:
+      group: production
+      cancel-in-progress: false
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6  # Updated from 1.5.0 to fix validation block issues
+
+      - name: Terraform Init
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: terraform init
+
+      - name: Terraform Plan (Infrastructure)
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        env:
+          TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+        run: |
+          terraform plan -var-file=terraform.tfvars -out=tfplan
+
+      - name: Terraform Apply (Infrastructure)
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        env:
+          TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+        run: terraform apply -auto-approve tfplan
+      
+      - name: Get Terraform Outputs
+        id: terraform-outputs
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          echo "Getting Terraform outputs..."
+
+          ECS_CLUSTER_NAME=$(terraform output -raw ecs_cluster_name)
+          ECS_SERVICE_NAME=$(terraform output -raw ecs_service_name)
+          API_DOMAIN=$(terraform output -raw api_domain)
+          ECR_REPOSITORY_NAME=$(terraform output -raw ecr_repository_name)
+
+          echo "ECS_CLUSTER_NAME: $ECS_CLUSTER_NAME"
+          echo "ECS_SERVICE_NAME: $ECS_SERVICE_NAME"
+          echo "API_DOMAIN: $API_DOMAIN"
+          echo "ECR_REPOSITORY_NAME: $ECR_REPOSITORY_NAME"
+
+          echo "ecs_cluster_name=$ECS_CLUSTER_NAME" >> $GITHUB_OUTPUT
+          echo "ecs_service_name=$ECS_SERVICE_NAME" >> $GITHUB_OUTPUT
+          echo "api_domain=$API_DOMAIN" >> $GITHUB_OUTPUT
+          echo "ecr_repository_name=$ECR_REPOSITORY_NAME" >> $GITHUB_OUTPUT
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ steps.terraform-outputs.outputs.ecr_repository_name }}
+          IMAGE_TAG: production-${{ github.sha }}
+        run: |
+          echo "Building Docker image..."
+          
+          # Build from BookstoreApi directory
+          docker build --platform linux/amd64 \
+            -f BookstoreApi/Dockerfile \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+            ./BookstoreApi
+
+          # Tag as latest for this environment
+          docker tag "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" "$ECR_REGISTRY/$ECR_REPOSITORY:production-latest"
+
+          # Push both tags
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:production-latest"
+
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Update ECS Service with New Image
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        env:
+          TF_VAR_container_image: ${{ steps.build-image.outputs.image }}
+          TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+        run: |
+          echo "🔄 Updating ECS service with image: $TF_VAR_container_image"
+          terraform plan -var-file=terraform.tfvars \
+            -var="container_image=$TF_VAR_container_image" \
+            -var="db_password=$TF_VAR_db_password" \
+            -out=tfplan-update
+          terraform apply -auto-approve tfplan-update
+
+      - name: Wait for ECS Service Stability
+        run: |
+          echo "⏳ Waiting for ECS service to stabilize..."
+
+          if ! timeout 900 aws ecs wait services-stable \
+            --cluster ${{ steps.terraform-outputs.outputs.ecs_cluster_name }} \
+            --services ${{ steps.terraform-outputs.outputs.ecs_service_name }}; then
+            echo "⚠️ Service failed to stabilize within 15 minutes"
+            
+            # Get service events
+            aws ecs describe-services \
+              --cluster ${{ steps.terraform-outputs.outputs.ecs_cluster_name }} \
+              --services ${{ steps.terraform-outputs.outputs.ecs_service_name }} \
+              --query 'services[0].events[:10]' \
+              --output table
+
+            exit 1
+          fi
+
+          echo "✅ Service is stable"
+
+      - name: Run Database Migrations
+        env:
+          ECS_CLUSTER: ${{ steps.terraform-outputs.outputs.ecs_cluster_name }}
+          ECS_SERVICE: ${{ steps.terraform-outputs.outputs.ecs_service_name }}
+        run: |
+          echo "🔄 Running database migrations..."
+
+          # Get service network configuration
+          SERVICE_INFO=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --query 'services[0]')
+
+          TASK_DEF_ARN=$(echo "$SERVICE_INFO" | jq -r '.taskDefinition')
+          SUBNETS=$(echo "$SERVICE_INFO" | jq -r '.networkConfiguration.awsvpcConfiguration.subnets | join(",")')
+          SECURITY_GROUPS=$(echo "$SERVICE_INFO" | jq -r '.networkConfiguration.awsvpcConfiguration.securityGroups | join(",")')
+
+          # Run migration task (with public IP enabled for ECR access)
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "$ECS_CLUSTER" \
+            --task-definition "$TASK_DEF_ARN" \
+            --overrides "{
+              \"containerOverrides\": [{
+                \"name\": \"api-container\",
+                \"environment\": [
+                  {\"name\": \"RUN_MIGRATION\", \"value\": \"1\"}
+                ]
+              }]
+            }" \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SECURITY_GROUPS],assignPublicIp=ENABLED}" \
+            --query 'tasks[0].taskArn' \
+            --output text)
+
+          echo "Migration task started: $TASK_ARN"
+          sleep 10
+
+          # Wait for migration
+          if ! timeout 600 aws ecs wait tasks-stopped --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN"; then
+            echo "❌ Migration timeout"
+            exit 1
+          fi
+
+          # Check exit code
+          EXIT_CODE=$(aws ecs describe-tasks \
+            --cluster "$ECS_CLUSTER" \
+            --tasks "$TASK_ARN" \
+            --query 'tasks[0].containers[0].exitCode' \
+            --output text)
+
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "❌ Migration failed with exit code: $EXIT_CODE"
+            
+            # Get logs
+            TASK_ID=$(echo "$TASK_ARN" | cut -d'/' -f3)
+            aws logs get-log-events \
+              --log-group-name "/ecs/tech-demo-production" \
+              --log-stream-name "ecs/api-container/$TASK_ID" \
+              --query 'events[*].message' \
+              --output text
+
+            exit 1
+          fi
+
+          echo "✅ Database migrations completed successfully"
+
+      - name: Trigger DNS Update
+        run: |
+          echo "🔄 Waiting for ECS task to start and DNS to update..."
+          echo "Lambda will automatically update Route53 when task reaches RUNNING state"
+          sleep 30  # Give Lambda time to update DNS
+
+      - name: Deployment Summary
+        run: |
+          echo "✅ Production deployment completed successfully!"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📦 Image: ${{ steps.build-image.outputs.image }}"
+          echo "🌐 API URL: ${{ steps.terraform-outputs.outputs.api_url }}"
+          echo "🏥 Health: ${{ steps.terraform-outputs.outputs.api_url }}/health"
+          echo "📚 Swagger: ${{ steps.terraform-outputs.outputs.api_url }}/swagger"
+          echo "🔧 Lambda: ${{ steps.terraform-outputs.outputs.lambda_function_name }}"
+          echo ""
+          echo "⚠️  Note: DNS update is automatic via Lambda"
+          echo "   It may take 1-2 minutes for DNS to propagate"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

@@ -1,0 +1,112 @@
+## .NET
+bin/
+obj/
+.vs/
+.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+## Build results
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+
+## Visual Studio cache/options directory
+.vs/
+
+## Rider
+.idea/
+
+## User-specific files
+*.rsuser
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+## Docker
+.dockerignore
+
+## Database
+*.db
+*.sqlite
+
+## Environment files
+appsettings.Development.json
+.env
+.env.local
+
+## Local development overrides (uncommitted)
+appsettings.*.local.json
+*.local.json
+
+## Terraform
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+*.tfplan          # Plan files (contain sensitive data)
+*.tfplan.*        # Plan files with any suffix
+tfplan            # Plan files without extension
+*.tfvars.local    # Local overrides with secrets
+*.tfvars.secret   # Any file explicitly marked as secret
+!terraform.tfvars # Commit project-specific tfvars (with placeholders for sharing)
+!*.tfvars.example # Commit example files
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+## Terraform Lambda artifacts
+*.zip
+lambda_*.zip
+
+## AWS
+.aws/
+
+## Node (for future frontend)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+dist/
+build/
+
+## OS files
+.DS_Store
+Thumbs.db
+
+## Ignored folders (reference implementations)
+Ignored/
+terraform/app-runner/
+terraform/ecs-fargate/
+
+## Frontend
+bookstore-ui/.vite/
+bookstore-ui/node_modules/
+
+## Removed from ignore - we document security trade-offs
+# SECURITY.md
+
+terraform/environments/production/tfplan
+
+## Temporary files / scripts (one-time use)
+*.ps1
+*.csx
+*update*.sql
+update-*.md
+reset-*.ps1
+generate-*.csx 
+
+terraform/environments/production/test-event.json

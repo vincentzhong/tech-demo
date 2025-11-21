@@ -1,0 +1,63 @@
+services:
+  # Migration service - runs once to update database schema
+  migration:
+    build:
+      context: ./BookstoreApi
+      dockerfile: Dockerfile
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - CONNECTION_STRING=Server=mysql;Database=Bookstore;Uid=root;Pwd=password;Port=3306;AllowPublicKeyRetrieval=true;
+      - RUN_MIGRATION=1
+      - JWT_SECRET=local-development-secret-key-minimum-32-characters
+      - ADMIN_USER=${ADMIN_USER:-admin:devpassword}
+      - DEMO_USER=${DEMO_USER:-demo:demo123}
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - bookstore-network
+    restart: "no"
+
+  api:
+    build:
+      context: ./BookstoreApi
+      dockerfile: Dockerfile
+    ports:
+      - "8081:80"  # Changed from 8080 to 8081
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - CONNECTION_STRING=Server=mysql;Database=Bookstore;Uid=root;Pwd=password;Port=3306;AllowPublicKeyRetrieval=true;
+      - JWT_SECRET=local-development-secret-key-minimum-32-characters
+      - ADMIN_USER=${ADMIN_USER:-admin:devpassword}
+      - DEMO_USER=${DEMO_USER:-demo:demo123}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+    networks:
+      - bookstore-network
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      - MYSQL_ROOT_PASSWORD=password
+      - MYSQL_DATABASE=Bookstore
+    ports:
+      - "3307:3306"  # Changed from 3306 to 3307
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - bookstore-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-ppassword"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mysql_data:
+
+networks:
+  bookstore-network:
+    driver: bridge
